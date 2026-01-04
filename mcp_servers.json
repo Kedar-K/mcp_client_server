@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "google-maps": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-google-maps"]
+    },
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@h1deya/mcp-server-weather"]
+    }
+  }
+}
