@@ -1,7 +1,9 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import sys
 from typing import Any, Optional
 from contextlib import AsyncExitStack
@@ -14,10 +16,13 @@ from dotenv import load_dotenv
 
 load_dotenv()  # load environment variables from .env
 
+_INVALID_TOOL_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
 class MCPClient:
     def __init__(self):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
+        self.sessions: dict[str, ClientSession] = {}
         self.exit_stack = AsyncExitStack()
         self.anthropic = Anthropic()
     # methods will go here
@@ -40,16 +45,21 @@ class MCPClient:
             env=None
         )
 
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
-
-        await self.session.initialize()
+        session = await self._open_session(server_params)
+        self.session = session
+        self.sessions = {"local": session}
 
         # List available tools
-        response = await self.session.list_tools()
+        response = await session.list_tools()
         tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools])   
+
+    async def _open_session(self, server_params: StdioServerParameters) -> ClientSession:
+        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+        stdio, write = stdio_transport
+        session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
+        await session.initialize()
+        return session
 
     async def connect_to_server_config(self, server_name: str, server_config: dict[str, Any]):
         """Connect to an MCP server using a config entry."""
@@ -77,18 +87,55 @@ class MCPClient:
             env=merged_env,
         )
 
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
+        session = await self._open_session(server_params)
+        self.session = session
+        self.sessions[server_name] = session
 
-        await self.session.initialize()
-
-        response = await self.session.list_tools()
+        response = await session.list_tools()
         tools = response.tools
         print(f"\nConnected to server '{server_name}' with tools:", [tool.name for tool in tools])
 
+    async def connect_to_servers_config(self, servers: dict[str, Any]):
+        """Connect to all MCP servers in a config."""
+        if not servers:
+            raise ValueError("No servers found in config")
+        for server_name, server_config in servers.items():
+            await self.connect_to_server_config(server_name, server_config)
+
+    def _make_safe_tool_name(self, server_name: str, tool_name: str, existing: set[str]) -> str:
+        base = f"{server_name}__{tool_name}"
+        safe = _INVALID_TOOL_CHARS.sub("_", base)
+        if not safe:
+            safe = "tool"
+        if len(safe) > 128:
+            digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+            max_prefix = 128 - 2 - len(digest)
+            prefix = safe[:max_prefix] if max_prefix > 0 else ""
+            safe = f"{prefix}__{digest}" if prefix else f"tool__{digest}"
+        if safe in existing:
+            digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+            max_prefix = 128 - 2 - len(digest)
+            prefix = safe[:max_prefix] if max_prefix > 0 else ""
+            candidate = f"{prefix}__{digest}" if prefix else f"tool__{digest}"
+            if candidate in existing:
+                suffix = 1
+                while True:
+                    extra = f"_{suffix}"
+                    max_prefix = 128 - len(extra)
+                    candidate = f"{safe[:max_prefix]}{extra}"
+                    if candidate not in existing:
+                        safe = candidate
+                        break
+                    suffix += 1
+            else:
+                safe = candidate
+        return safe
+
     async def process_query(self, query: str) -> str:
         """Process a query using Claude and available tools"""
+        if self.session is None and not self.sessions:
+            raise RuntimeError("No MCP server connection established")
+
         messages = [
             {
                 "role": "user",
@@ -96,12 +143,38 @@ class MCPClient:
             }
         ]
 
-        response = await self.session.list_tools()
-        available_tools = [{
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
-        } for tool in response.tools]
+        multi_server = len(self.sessions) > 1
+        available_tools = []
+        tool_name_map: dict[str, tuple[str, str]] = {}
+        single_session: Optional[ClientSession] = None
+
+        if multi_server:
+            existing_names: set[str] = set()
+            for server_name, session in self.sessions.items():
+                response = await session.list_tools()
+                for tool in response.tools:
+                    exposed_name = self._make_safe_tool_name(server_name, tool.name, existing_names)
+                    existing_names.add(exposed_name)
+                    tool_name_map[exposed_name] = (server_name, tool.name)
+                    description = tool.description or ""
+                    label = f"[{server_name}] {tool.name}"
+                    if description:
+                        description = f"{label}: {description}"
+                    else:
+                        description = label
+                    available_tools.append({
+                        "name": exposed_name,
+                        "description": description,
+                        "input_schema": tool.inputSchema
+                    })
+        else:
+            single_session = self.session or next(iter(self.sessions.values()))
+            response = await single_session.list_tools()
+            available_tools = [{
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema
+            } for tool in response.tools]
 
         # Initial Claude API call
         response = self.anthropic.messages.create(
@@ -114,44 +187,57 @@ class MCPClient:
         # Process response and handle tool calls
         final_text = []
 
-        assistant_message_content = []
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
+        while True:
+            assistant_message_content = []
+            tool_results = []
+            for content in response.content:
                 assistant_message_content.append(content)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
+                if content.type == 'text':
+                    final_text.append(content.text)
+                elif content.type == 'tool_use':
+                    tool_name = content.name
+                    tool_args = content.input
 
-                # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                    if multi_server:
+                        mapping = tool_name_map.get(tool_name)
+                        if mapping is None:
+                            raise ValueError(f"Tool name '{tool_name}' not found in mapping")
+                        server_name, actual_tool_name = mapping
+                        session = self.sessions.get(server_name)
+                        if session is None:
+                            raise ValueError(f"Server '{server_name}' not connected")
+                    else:
+                        session = single_session or self.session
+                        if session is None:
+                            raise RuntimeError("No MCP server connection established")
+                        actual_tool_name = tool_name
 
-                assistant_message_content.append(content)
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_message_content
-                })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": result.content
-                        }
-                    ]
-                })
+                    result = await session.call_tool(actual_tool_name, tool_args)
+                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": content.id,
+                        "content": result.content
+                    })
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=1000,
-                    messages=messages,
-                    tools=available_tools
-                )
+            if not tool_results:
+                break
 
-                final_text.append(response.content[0].text)
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message_content
+            })
+            messages.append({
+                "role": "user",
+                "content": tool_results
+            })
+
+            response = self.anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1000,
+                messages=messages,
+                tools=available_tools
+            )
 
         return "\n".join(final_text)
     
@@ -192,11 +278,12 @@ async def main():
     parser.add_argument("script", nargs="?", help="Path to local server script (.py or .js)")
     parser.add_argument("--config", help="Path to MCP servers JSON config")
     parser.add_argument("--server", help="Server name from config")
+    parser.add_argument("--all", action="store_true", help="Connect to all servers in config")
     parser.add_argument("--list-servers", action="store_true", help="List servers in config and exit")
     args = parser.parse_args()
 
     if not args.script and not args.config:
-        print("Usage: python client.py <path_to_server_script> or --config <config.json> --server <name>")
+        print("Usage: python client.py <path_to_server_script> or --config <config.json> --server <name>|--all")
         sys.exit(1)
 
     if args.config and args.script:
@@ -210,13 +297,19 @@ async def main():
             if args.list_servers:
                 print("Available servers:", ", ".join(sorted(servers.keys())))
                 return
-            if not args.server:
-                print("--server is required when using --config.")
+            if args.server and args.all:
+                print("Provide either --server or --all, not both.")
                 sys.exit(1)
-            if args.server not in servers:
-                print(f"Server '{args.server}' not found in config.")
+            if not args.server and not args.all:
+                print("--server or --all is required when using --config.")
                 sys.exit(1)
-            await client.connect_to_server_config(args.server, servers[args.server])
+            if args.all:
+                await client.connect_to_servers_config(servers)
+            else:
+                if args.server not in servers:
+                    print(f"Server '{args.server}' not found in config.")
+                    sys.exit(1)
+                await client.connect_to_server_config(args.server, servers[args.server])
         else:
             await client.connect_to_server(args.script)
         await client.chat_loop()
@@ -225,3 +318,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# emailing
+# trip with family and friends suggestions
